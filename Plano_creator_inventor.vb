@@ -26,6 +26,10 @@
 '                ese extremo, en el lado opuesto de la vista. Diametros con cantidad (studs
 '                y sus agujeros), radios, angulo y longitud de la arista inclinada principal;
 '                marcas de centro. La isometrica no se acota.
+'                PROFUNDIDADES: cada agujero ciego lleva tras su diametro el simbolo de
+'                profundidad y la medida leida del modelo (ejemplo 2X diametro 3,00, el simbolo
+'                y 1,80); los pasantes llevan PASANTE. Cada bolsillo cerrado no circular recibe
+'                una nota con flecha sobre su fondo con el simbolo y su profundidad.
 '   6. VERIFICAR Y CORREGIR: si algo no cabe, se monta o falta, separa mas las vistas sin
 '                bajar la escala y repite; solo el ultimo intento puede bajarla. Se queda con
 '                el intento con menos problemas (a igualdad, el de escala mayor).
@@ -191,10 +195,22 @@ Private Const PASO As Double = 0.7
 Private Const SEP_MIN As Double = 0.2
 Private Const PESO_MIN As Double = 0.3
 Private Const MAX_INTERMEDIAS As Integer = 3
-Private Const MAX_DIAMETROS As Integer = 6
+Private Const MAX_DIAMETROS As Integer = 8
 Private Const MAX_RADIOS As Integer = 2
 Private Const DIAM_MIN_MM As Double = 0.8
 Private Const RADIO_MIN_MM As Double = 0.8
+
+' Profundidades. La cota de un agujero ciego termina con el simbolo de profundidad y su medida;
+' un bolsillo cerrado no circular recibe una nota con flecha. FUENTE_PROF dibuja el simbolo:
+' si en el plano sale un cuadro vacio, prueba Cambria Math o Arial Unicode MS.
+Private Const FUENTE_PROF As String = "Segoe UI Symbol"
+Private Const TEXTO_PASANTE As String = "PASANTE"
+Private Const PROF_MIN_MM As Double = 0.05
+Private Const MAX_BOLSILLOS As Integer = 6
+Private Const TOL_CIL As Double = 0.002
+Private Const TOL_BOLS As Double = 0.002
+' coseno de 2,5 grados: un vector mas cercano que eso a un eje se redondea al eje
+Private Const COS_EJE As Double = 0.99905
 
 Private Const LADO_IZQ As Integer = 0
 Private Const LADO_DER As Integer = 1
@@ -265,6 +281,9 @@ Private mRadioHechos As New List(Of Double)
 Private mAngHechos As New List(Of Double)
 Private mLongHechas As New List(Of Double)
 Private mLideres As New List(Of Double())
+Private mDiamClaves As New List(Of String)
+Private mProfHechas As Integer = 0
+Private mCajaGrande As Boolean = False
 Private mModoCaja As String = ""
 Private mBorde As Marco
 Private mLadosYFrontal() As Integer = New Integer() {LADO_IZQ, LADO_DER}
@@ -1035,6 +1054,8 @@ Private Function Ensayo(k As Integer, Optional forzar As Boolean = False) As Int
 	End If
 	Linea("-- Diametros y radios")
 	AcotarCurvas()
+	Linea("-- Profundidades de bolsillos")
+	AcotarBolsillos()
 	Linea("-- Verificacion")
 	Return Verificar()
 End Function
@@ -1054,6 +1075,8 @@ Private Sub ReiniciarEstado()
 	mAngHechos.Clear()
 	mLongHechas.Clear()
 	mLideres.Clear()
+	mDiamClaves.Clear()
+	mProfHechas = 0
 End Sub
 
 Private Function TamanoEnum(i As Integer) As DrawingSheetSizeEnum
@@ -1511,6 +1534,12 @@ Private Sub BorrarAnotaciones()
 	For Each cm As Object In mHoja.Centermarks
 		lista.Add(cm)
 	Next
+	Try
+		For Each ln As LeaderNote In mHoja.DrawingNotes.LeaderNotes
+			If ln.FormattedText.Contains(ChrW(&H21A7)) Then lista.Add(ln)
+		Next
+	Catch
+	End Try
 	For Each o As Object In lista
 		Try
 			o.Delete()
@@ -1782,6 +1811,11 @@ Private Function Verificar() As Integer
 	Next
 	If solapes = 0 Then Ok("Ningun texto de cota se solapa con otro (" & lista.Count & " textos, cajas " & If(mModoCaja = "", "estimadas", mModoCaja) & ").")
 	Ok("Sin duplicados: cada medida lineal se acoto en una sola vista (" & mReg.Count & " registradas).")
+	If mProfHechas > 0 Then
+		Ok("Profundidades con " & ChrW(&H21A7) & ": " & mProfHechas & " (agujeros ciegos y bolsillos).")
+	Else
+		Linea("   Sin agujeros ciegos ni bolsillos que pidan cota de profundidad.")
+	End If
 	' Isometrica: existe, dentro del borde, sin tocar otras vistas, textos ni el cajetin
 	If mVIso Is Nothing Then
 		Falta("Falta la vista isometrica.")
@@ -2681,22 +2715,6 @@ End Function
 ' (dx, dy) del texto: centrada si centrado = True; si no, hacia ambos lados del origen (estimacion
 ' conservadora, porque el texto de un diametro puede crecer hacia cualquier lado de su linea).
 Private Function CajaTexto(cota As Object, dx As Double, dy As Double, centrado As Boolean) As Marco
-	Try
-		Dim rb As Object = cota.Text.RangeBox
-		Dim m As New Marco(CDbl(rb.MinPoint.X), CDbl(rb.MinPoint.Y), CDbl(rb.MaxPoint.X), CDbl(rb.MaxPoint.Y))
-		If m.W > 0.01 AndAlso m.H > 0.01 Then
-			If mModoCaja = "" Then
-				mModoCaja = "medida por Inventor"
-				Linea("   Cajas de texto: medidas por Inventor.")
-			End If
-			Return m.Expandir(0.05)
-		End If
-	Catch
-	End Try
-	If mModoCaja = "" Then
-		mModoCaja = "estimada"
-		Linea("   Cajas de texto: Inventor no da su tamano; se estiman con margen.")
-	End If
 	Dim ox As Double = 0
 	Dim oy As Double = 0
 	Try
@@ -2710,7 +2728,33 @@ Private Function CajaTexto(cota As Object, dx As Double, dy As Double, centrado 
 	Catch
 	End Try
 	If txt = "" Then txt = "00,00"
-	Return CajaEstimada(ox, oy, txt.Length, AlturaTexto(cota), dx, dy, centrado)
+	Dim est As Marco = CajaEstimada(ox, oy, txt.Length, AlturaTexto(cota), dx, dy, centrado)
+	Try
+		Dim rb As Object = cota.Text.RangeBox
+		Dim m As New Marco(CDbl(rb.MinPoint.X), CDbl(rb.MinPoint.Y), CDbl(rb.MaxPoint.X), CDbl(rb.MaxPoint.Y))
+		If m.W > 0.01 AndAlso m.H > 0.01 Then
+			If mModoCaja = "" Then
+				mModoCaja = "medida por Inventor"
+				Linea("   Cajas de texto: medidas por Inventor.")
+			End If
+			' Algunas cotas de diametro devuelven una caja que abarca tambien su linea de referencia:
+			' si es mucho mayor que el texto estimado, se usa la estimada
+			If m.W * m.H > 3.0 * est.W * est.H AndAlso (m.W > est.W + 1.0 OrElse m.H > est.H + 1.0) Then
+				If Not mCajaGrande Then
+					mCajaGrande = True
+					Linea("   Cajas de texto: algunas cajas medidas incluyen la linea de referencia; en esas se usa la estimada.")
+				End If
+				Return est.Expandir(0.05)
+			End If
+			Return m.Expandir(0.05)
+		End If
+	Catch
+	End Try
+	If mModoCaja = "" Then
+		mModoCaja = "estimada"
+		Linea("   Cajas de texto: Inventor no da su tamano; se estiman con margen.")
+	End If
+	Return est
 End Function
 
 Private Function CajaEstimada(ox As Double, oy As Double, nCar As Integer, altoT As Double, dx As Double, dy As Double, centrado As Boolean) As Marco
@@ -2863,16 +2907,17 @@ Private Sub AcotarCirculosVista(vi As VistaInfo)
 		Else
 			If valor < DIAM_MIN_MM Then Continue For
 		End If
+		If Not esRadio Then LeerCilindro(ci)
 		Dim g As GrupoD = Nothing
 		For Each q As GrupoD In grupos
-			If q.EsRadio = esRadio AndAlso Math.Abs(q.Valor - valor) < 0.02 Then
+			If q.EsRadio = esRadio AndAlso Math.Abs(q.Valor - valor) < 0.02 AndAlso q.Tipo = ci.Tipo AndAlso Math.Abs(q.Prof - ci.Prof) < 0.02 Then
 				g = q
 				Exit For
 			End If
 		Next
 		If g Is Nothing Then
 			g = New GrupoD()
-			g.Valor = valor : g.EsRadio = esRadio : g.Rep = ci
+			g.Valor = valor : g.EsRadio = esRadio : g.Rep = ci : g.Tipo = ci.Tipo : g.Prof = ci.Prof
 			grupos.Add(g)
 		End If
 		Dim nuevo As Boolean = True
@@ -2893,7 +2938,7 @@ Private Sub AcotarCirculosVista(vi As VistaInfo)
 			Next
 			If Not esDeCirculo Then radios.Add(g)
 		Else
-			If Not ContieneAprox(mDiamHechos, g.Valor, 0.02) Then diams.Add(g)
+			If Not mDiamClaves.Contains(ClaveDiam(g)) Then diams.Add(g)
 		End If
 	Next
 	diams.Sort(Function(g1 As GrupoD, g2 As GrupoD) g2.Valor.CompareTo(g1.Valor))
@@ -2916,8 +2961,12 @@ Private Sub AcotarCirculosVista(vi As VistaInfo)
 		Dim miembros As New List(Of Circ)(g.Miembros)
 		miembros.Sort(Function(c1 As Circ, c2 As Circ) DistBorde(vi.R, c1).CompareTo(DistBorde(vi.R, c2)))
 		Dim cant As Integer = g.Miembros.Count
-		Dim etiqueta As String = If(cant > 1, cant & "X ", "") & If(g.EsRadio, "R", ChrW(216)) & F(g.Valor, 2)
+		Dim etiqueta As String = If(cant > 1, cant & "X ", "") & If(g.EsRadio, "R", ChrW(216)) & F(g.Valor, 2) & SufijoProf(g, False)
 		Dim hecho As Boolean = False
+		Dim nSinIni As Integer = 0
+		Dim nLid As Integer = 0
+		Dim nEst As Integer = 0
+		Dim nReal As Integer = 0
 		For Each rep As Circ In miembros
 			Dim cands As New List(Of Double())
 			Dim arranques As New List(Of Double())
@@ -2931,15 +2980,21 @@ Private Sub AcotarCirculosVista(vi As VistaInfo)
 			Next
 			' Posicion inicial: la primera que parece libre
 			Dim inicial As Double() = Nothing
-			For Each c As Double() In cands
-				Dim ax0 As Double = rep.CX + (c(0) - rep.CX) / Math.Max(0.0001, Dist(rep.CX, rep.CY, c(0), c(1))) * rep.R
-				Dim ay0 As Double = rep.CY + (c(1) - rep.CY) / Math.Max(0.0001, Dist(rep.CX, rep.CY, c(0), c(1))) * rep.R
-				If CajaLibre(CajaEstimada(c(0), c(1), etiqueta.Length, 0.35, c(0) - rep.CX, c(1) - rep.CY, False)) AndAlso LiderLibre(ax0, ay0, c(0), c(1), vi.Nombre, True) Then
-					inicial = c
-					Exit For
-				End If
+			For pasIni As Integer = 0 To 1
+				For Each c As Double() In cands
+					Dim ax0 As Double = rep.CX + (c(0) - rep.CX) / Math.Max(0.0001, Dist(rep.CX, rep.CY, c(0), c(1))) * rep.R
+					Dim ay0 As Double = rep.CY + (c(1) - rep.CY) / Math.Max(0.0001, Dist(rep.CX, rep.CY, c(0), c(1))) * rep.R
+					If CajaLibre(CajaEstimada(c(0), c(1), etiqueta.Length, 0.35, c(0) - rep.CX, c(1) - rep.CY, False)) AndAlso LiderLibre(ax0, ay0, c(0), c(1), vi.Nombre, pasIni = 0) Then
+						inicial = c
+						Exit For
+					End If
+				Next
+				If inicial IsNot Nothing Then Exit For
 			Next
-			If inicial Is Nothing Then Continue For
+			If inicial Is Nothing Then
+				nSinIni += 1
+				Continue For
+			End If
 
 			Dim cota As Object = CrearRadial(g, rep, Pt(inicial(0), inicial(1)))
 			If cota Is Nothing Then Exit For
@@ -2949,6 +3004,20 @@ Private Sub AcotarCirculosVista(vi As VistaInfo)
 				Catch
 				End Try
 			End If
+			' Profundidad del agujero ciego (o PASANTE) a continuacion del diametro
+			Dim sufP As String = SufijoProf(g, True)
+			If sufP <> "" Then
+				Dim previo As String = ""
+				Try
+					previo = CStr(cota.Text.FormattedText)
+					cota.Text.FormattedText = previo & sufP
+				Catch
+					Try
+						cota.Text.FormattedText = previo & SufijoProf(g, False)
+					Catch
+					End Try
+				End Try
+			End If
 			' Probar posiciones con la caja real del texto; la linea de referencia arranca en el borde del circulo
 			Dim caja As Marco = Nothing
 			For pasada As Integer = 0 To 1
@@ -2956,8 +3025,14 @@ Private Sub AcotarCirculosVista(vi As VistaInfo)
 					Dim dd As Double = Math.Max(0.0001, Dist(rep.CX, rep.CY, c(0), c(1)))
 					Dim ax As Double = rep.CX + (c(0) - rep.CX) / dd * rep.R
 					Dim ay As Double = rep.CY + (c(1) - rep.CY) / dd * rep.R
-					If Not LiderLibre(ax, ay, c(0), c(1), vi.Nombre, pasada = 0) Then Continue For
-					If mModoCaja = "medida por Inventor" AndAlso Not CajaLibre(CajaEstimada(c(0), c(1), etiqueta.Length, 0.35, c(0) - rep.CX, c(1) - rep.CY, True).Expandir(-0.05)) Then Continue For
+					If Not LiderLibre(ax, ay, c(0), c(1), vi.Nombre, pasada = 0) Then
+						nLid += 1
+						Continue For
+					End If
+					If mModoCaja = "medida por Inventor" AndAlso Not CajaLibre(CajaEstimada(c(0), c(1), etiqueta.Length, 0.35, c(0) - rep.CX, c(1) - rep.CY, True).Expandir(-0.05)) Then
+						nEst += 1
+						Continue For
+					End If
 					If Not MoverTexto(cota, c(0), c(1)) Then Exit For
 					Dim cj As Marco = CajaTexto(cota, c(0) - rep.CX, c(1) - rep.CY, False)
 					If CajaLibre(cj) Then
@@ -2966,6 +3041,7 @@ Private Sub AcotarCirculosVista(vi As VistaInfo)
 						mLideres.Add(New Double() {ax, ay, c(0), c(1)})
 						Exit For
 					End If
+					nReal += 1
 				Next
 				If caja IsNot Nothing Then Exit For
 			Next
@@ -2986,9 +3062,11 @@ Private Sub AcotarCirculosVista(vi As VistaInfo)
 				mRadioHechos.Add(g.Valor)
 			Else
 				mDiamHechos.Add(g.Valor)
+				mDiamClaves.Add(ClaveDiam(g))
+				If g.Tipo = 1 AndAlso g.Prof >= PROF_MIN_MM Then mProfHechas += 1
 			End If
 			Dim vmm As Double = ValorMm(cota, g.Valor)
-			Dim desc As String = If(cant > 1, cant & "X ", "") & If(g.EsRadio, "R", ChrW(216)) & F(vmm, 2) & " mm"
+			Dim desc As String = If(cant > 1, cant & "X ", "") & If(g.EsRadio, "R", ChrW(216)) & F(vmm, 2) & " mm" & SufijoProf(g, False)
 			mCreadas.Add(New Creada(cota, vi.Nombre, desc))
 			mCreadas(mCreadas.Count - 1).Caja = caja
 			Ok(vi.Nombre & ": " & desc)
@@ -2999,11 +3077,426 @@ Private Sub AcotarCirculosVista(vi As VistaInfo)
 			If g.EsRadio Then
 				Linea("   " & vi.Nombre & ": " & etiqueta & " no cabe sin tocar otra anotacion (o la API no deja acotarlo); se omite.")
 			Else
-				Falta(vi.Nombre & ": " & etiqueta & " no cabe sin tocar otra anotacion.")
+				Falta(vi.Nombre & ": " & etiqueta & " no cabe sin tocar otra anotacion (sin sitio inicial " & nSinIni &
+					  ", linea bloqueada " & nLid & ", caja estimada ocupada " & nEst & ", caja real ocupada " & nReal & ").")
 			End If
 		End If
 	Next
 End Sub
+
+' ================================ PROFUNDIDADES ================================
+' Lee del modelo el cilindro de la arista: concavo (agujero) o convexo (saliente), su longitud sobre
+' el eje y si tiene fondo. Tipo: 0 sin datos, 1 agujero ciego, 2 pasante, 3 saliente.
+Private Sub LeerCilindro(ci As Circ)
+	If ci.InfoLeida Then Return
+	ci.InfoLeida = True
+	ci.Prof = -1
+	ci.Tipo = 0
+	Try
+		Dim ed As Object = ci.Curva.ModelGeometry
+		If ed Is Nothing Then Return
+		Dim rEd As Double = RadioArista(ed)
+		If rEd <= 0 Then Return
+		Dim cara As Object = Nothing
+		For Each fc As Object In ed.Faces
+			Try
+				If fc.SurfaceType = SurfaceTypeEnum.kCylinderSurface Then
+					If Math.Abs(CDbl(fc.Geometry.Radius) - rEd) < TOL_CIL Then
+						cara = fc
+						Exit For
+					End If
+				End If
+			Catch
+			End Try
+		Next
+		If cara Is Nothing Then Return
+		Dim cil As Object = cara.Geometry
+		Dim bp() As Double = {CDbl(cil.BasePoint.X), CDbl(cil.BasePoint.Y), CDbl(cil.BasePoint.Z)}
+		Dim ejeC() As Double = Unitario(CDbl(cil.AxisVector.X), CDbl(cil.AxisVector.Y), CDbl(cil.AxisVector.Z))
+		If ejeC Is Nothing Then Return
+		' Concavo o convexo: normal exterior contra el vector radial
+		Dim nc() As Double = NormalCara(cara)
+		If nc Is Nothing Then Return
+		Dim pq() As Double = {nc(3), nc(4), nc(5)}
+		Dim tq As Double = ProyEje(pq, bp, ejeC)
+		Dim radX As Double = pq(0) - (bp(0) + ejeC(0) * tq)
+		Dim radY As Double = pq(1) - (bp(1) + ejeC(1) * tq)
+		Dim radZ As Double = pq(2) - (bp(2) + ejeC(2) * tq)
+		ci.Concavo = (radX * nc(0) + radY * nc(1) + radZ * nc(2)) < 0
+		' Extension sobre el eje: centros de las aristas circulares y vertices de las demas
+		Dim tMin As Double = Double.MaxValue
+		Dim tMax As Double = -Double.MaxValue
+		For Each e2 As Object In cara.Edges
+			For Each pa As Double() In PuntosArista(e2)
+				Dim tp As Double = ProyEje(pa, bp, ejeC)
+				tMin = Math.Min(tMin, tp)
+				tMax = Math.Max(tMax, tp)
+			Next
+		Next
+		If tMax - tMin < 0.0001 Then Return
+		ci.Prof = (tMax - tMin) * 10.0
+		If Not ci.Concavo Then
+			ci.Tipo = 3
+			Return
+		End If
+		' Un extremo es fondo si la cara vecina mira hacia el interior del agujero
+		Dim cerradoMin As Boolean = False
+		Dim cerradoMax As Boolean = False
+		For Each e2 As Object In cara.Edges
+			If RadioArista(e2) <= 0 Then Continue For
+			Dim pc As List(Of Double()) = PuntosArista(e2)
+			If pc.Count = 0 Then Continue For
+			Dim te As Double = ProyEje(pc(0), bp, ejeC)
+			Dim enMin As Boolean = Math.Abs(te - tMin) < TOL_CIL
+			Dim enMax As Boolean = Math.Abs(te - tMax) < TOL_CIL
+			If Not enMin AndAlso Not enMax Then Continue For
+			Dim signoE As Double = If(enMin, 1.0, -1.0)
+			For Each fo As Object In e2.Faces
+				Try
+					If fo.SurfaceType = SurfaceTypeEnum.kCylinderSurface Then
+						If Math.Abs(CDbl(fo.Geometry.Radius) - rEd) < TOL_CIL Then Continue For
+					End If
+					Dim nfo() As Double = NormalCara(fo)
+					If nfo Is Nothing Then Continue For
+					If signoE * (nfo(0) * ejeC(0) + nfo(1) * ejeC(1) + nfo(2) * ejeC(2)) > 0.1 Then
+						If enMin Then cerradoMin = True Else cerradoMax = True
+					End If
+				Catch
+				End Try
+			Next
+		Next
+		ci.Tipo = If(cerradoMin OrElse cerradoMax, 1, 2)
+	Catch
+		ci.Tipo = 0
+		ci.Prof = -1
+	End Try
+End Sub
+
+' Texto que sigue al diametro: simbolo de profundidad y medida en agujeros ciegos, PASANTE en los pasantes
+Private Function SufijoProf(g As GrupoD, conFormato As Boolean) As String
+	If g.EsRadio Then Return ""
+	If g.Tipo = 1 AndAlso g.Prof >= PROF_MIN_MM Then
+		If conFormato Then Return " <StyleOverride Font='" & FUENTE_PROF & "'>" & ChrW(&H21A7) & "</StyleOverride> " & F(g.Prof, 2)
+		Return " " & ChrW(&H21A7) & " " & F(g.Prof, 2)
+	End If
+	If g.Tipo = 2 AndAlso TEXTO_PASANTE <> "" Then Return " " & TEXTO_PASANTE
+	Return ""
+End Function
+
+Private Function ClaveDiam(g As GrupoD) As String
+	Return F(g.Valor, 2) & "|" & g.Tipo & "|" & F(g.Prof, 2)
+End Function
+
+Private Function RadioArista(ed As Object) As Double
+	Try
+		Dim gm As Object = ed.Geometry
+		If TypeOf gm Is Inventor.Circle Then Return CType(gm, Inventor.Circle).Radius
+		If TypeOf gm Is Inventor.Arc3d Then Return CType(gm, Inventor.Arc3d).Radius
+	Catch
+	End Try
+	Return 0
+End Function
+
+' Puntos de una arista para medir su extension: el centro si es circular, si no sus vertices
+Private Function PuntosArista(ed As Object) As List(Of Double())
+	Dim l As New List(Of Double())
+	Try
+		Dim gm As Object = ed.Geometry
+		If TypeOf gm Is Inventor.Circle Then
+			Dim cc As Inventor.Point = CType(gm, Inventor.Circle).Center
+			l.Add(New Double() {cc.X, cc.Y, cc.Z})
+			Return l
+		End If
+		If TypeOf gm Is Inventor.Arc3d Then
+			Dim ca As Inventor.Point = CType(gm, Inventor.Arc3d).Center
+			l.Add(New Double() {ca.X, ca.Y, ca.Z})
+			Return l
+		End If
+	Catch
+	End Try
+	Try
+		Dim p1 As Object = ed.StartVertex.Point
+		l.Add(New Double() {CDbl(p1.X), CDbl(p1.Y), CDbl(p1.Z)})
+	Catch
+	End Try
+	Try
+		Dim p2 As Object = ed.StopVertex.Point
+		l.Add(New Double() {CDbl(p2.X), CDbl(p2.Y), CDbl(p2.Z)})
+	Catch
+	End Try
+	Return l
+End Function
+
+Private Function ProyEje(pp() As Double, bp() As Double, ejeC() As Double) As Double
+	Return (pp(0) - bp(0)) * ejeC(0) + (pp(1) - bp(1)) * ejeC(1) + (pp(2) - bp(2)) * ejeC(2)
+End Function
+
+' Normal exterior en Face.PointOnFace: {nx, ny, nz, px, py, pz} en cm, o Nothing
+Private Function NormalCara(fc As Object) As Double()
+	Try
+		Dim cf As Face = CType(fc, Face)
+		Dim pf As Inventor.Point = cf.PointOnFace
+		Dim pts() As Double = {pf.X, pf.Y, pf.Z}
+		Dim nrm(2) As Double
+		cf.Evaluator.GetNormalAtPoint(pts, nrm)
+		Dim u() As Double = Unitario(nrm(0), nrm(1), nrm(2))
+		If u Is Nothing Then Return Nothing
+		Return New Double() {u(0), u(1), u(2), pf.X, pf.Y, pf.Z}
+	Catch
+		Return Nothing
+	End Try
+End Function
+
+Private Function Unitario(x As Double, y As Double, z As Double) As Double()
+	Dim lv As Double = Math.Sqrt(x * x + y * y + z * z)
+	If lv < 0.0000001 Then Return Nothing
+	Return New Double() {x / lv, y / lv, z / lv}
+End Function
+
+Private Function RedondearEje(u() As Double) As Double()
+	If u Is Nothing Then Return Nothing
+	Dim rr() As Double = {u(0), u(1), u(2)}
+	For i As Integer = 0 To 2
+		If Math.Abs(rr(i)) > COS_EJE Then
+			Dim sg As Double = Math.Sign(rr(i))
+			rr(0) = 0 : rr(1) = 0 : rr(2) = 0
+			rr(i) = sg
+			Exit For
+		End If
+	Next
+	Return rr
+End Function
+
+' Direccion hacia el observador de una vista, en coordenadas del modelo
+Private Function DirVista(vi As VistaInfo) As Double()
+	Try
+		Dim o As Object = vi.V
+		Dim cam As Object = o.Camera
+		Return RedondearEje(Unitario(CDbl(cam.Eye.X) - CDbl(cam.Target.X), CDbl(cam.Eye.Y) - CDbl(cam.Target.Y), CDbl(cam.Eye.Z) - CDbl(cam.Target.Z)))
+	Catch
+		Return Nothing
+	End Try
+End Function
+
+' Extension de una cara segun una direccion (con su caja), {min, max} en cm
+Private Function ExtensionCara(fc As Object, dn() As Double) As Double()
+	Try
+		Dim rb As Object = fc.Evaluator.RangeBox
+		Dim xs() As Double = {CDbl(rb.MinPoint.X), CDbl(rb.MaxPoint.X)}
+		Dim ys() As Double = {CDbl(rb.MinPoint.Y), CDbl(rb.MaxPoint.Y)}
+		Dim zs() As Double = {CDbl(rb.MinPoint.Z), CDbl(rb.MaxPoint.Z)}
+		Dim mn As Double = Double.MaxValue
+		Dim mx As Double = -Double.MaxValue
+		For Each xv As Double In xs
+			For Each yv As Double In ys
+				For Each zv As Double In zs
+					Dim pr As Double = xv * dn(0) + yv * dn(1) + zv * dn(2)
+					mn = Math.Min(mn, pr)
+					mx = Math.Max(mx, pr)
+				Next
+			Next
+		Next
+		Return New Double() {mn, mx}
+	Catch
+		Return Nothing
+	End Try
+End Function
+
+Private Function EsMismaCara(fa As Object, fb As Object) As Boolean
+	If fa Is fb Then Return True
+	Try
+		If fa.SurfaceType <> fb.SurfaceType Then Return False
+		Dim pa As Object = fa.PointOnFace
+		Dim pb As Object = fb.PointOnFace
+		Return Math.Abs(CDbl(pa.X) - CDbl(pb.X)) < 0.000001 AndAlso Math.Abs(CDbl(pa.Y) - CDbl(pb.Y)) < 0.000001 AndAlso Math.Abs(CDbl(pa.Z) - CDbl(pb.Z)) < 0.000001
+	Catch
+		Return False
+	End Try
+End Function
+
+' Bolsillos cerrados no circulares: una cara plana cuyas vecinas del contorno exterior suben todas
+' por encima de ella (al menos 3 paredes, no solo aristas circulares). Profundidad = la pared mas baja.
+' Los iguales (misma direccion y profundidad) se agrupan en uno con nX.
+Private Function BuscarBolsillos() As List(Of Bolsillo)
+	Dim lista As New List(Of Bolsillo)
+	Dim oDoc As Object = mPieza
+	Dim defP As Object = oDoc.ComponentDefinition
+	For Each sb As SurfaceBody In Cuerpos(defP)
+		For Each fc As Face In sb.Faces
+			Try
+				If fc.SurfaceType <> SurfaceTypeEnum.kPlaneSurface Then Continue For
+				Dim nf() As Double = NormalCara(fc)
+				If nf Is Nothing Then Continue For
+				Dim nn() As Double = RedondearEje(nf)
+				Dim nivel As Double = nf(3) * nn(0) + nf(4) * nn(1) + nf(5) * nn(2)
+				Dim hondo As Double = Double.MaxValue
+				Dim paredes As Integer = 0
+				Dim soloCirc As Boolean = True
+				Dim valido As Boolean = True
+				For Each lazo As EdgeLoop In fc.EdgeLoops
+					If Not lazo.IsOuterEdgeLoop Then Continue For
+					For Each ed As Edge In lazo.Edges
+						If RadioArista(ed) <= 0 Then soloCirc = False
+						For Each fo As Face In ed.Faces
+							If EsMismaCara(fo, fc) Then Continue For
+							Dim rg() As Double = ExtensionCara(fo, nn)
+							If rg Is Nothing OrElse rg(0) < nivel - TOL_BOLS OrElse rg(1) < nivel + TOL_BOLS Then
+								valido = False
+								Exit For
+							End If
+							hondo = Math.Min(hondo, rg(1) - nivel)
+							paredes += 1
+						Next
+						If Not valido Then Exit For
+					Next
+					If Not valido Then Exit For
+				Next
+				If Not valido OrElse soloCirc OrElse paredes < 3 OrElse hondo = Double.MaxValue Then Continue For
+				Dim pmm As Double = hondo * 10.0
+				If pmm < PROF_MIN_MM Then Continue For
+				Dim b As Bolsillo = Nothing
+				For Each q As Bolsillo In lista
+					If Math.Abs(q.NX - nn(0)) < 0.001 AndAlso Math.Abs(q.NY - nn(1)) < 0.001 AndAlso Math.Abs(q.NZ - nn(2)) < 0.001 AndAlso Math.Abs(q.Prof - pmm) < 0.01 Then
+						b = q
+						Exit For
+					End If
+				Next
+				If b Is Nothing Then
+					b = New Bolsillo()
+					b.NX = nn(0) : b.NY = nn(1) : b.NZ = nn(2) : b.Prof = pmm
+					lista.Add(b)
+				End If
+				b.Caras.Add(fc)
+			Catch
+			End Try
+		Next
+	Next
+	Return lista
+End Function
+
+Private Sub AcotarBolsillos()
+	Dim bols As List(Of Bolsillo) = Nothing
+	Try
+		bols = BuscarBolsillos()
+	Catch ex As Exception
+		Aviso("No pude buscar bolsillos: " & ex.Message)
+		Return
+	End Try
+	If bols.Count = 0 Then
+		Linea("   Bolsillos cerrados no circulares: ninguno.")
+		Return
+	End If
+	Linea("   Bolsillos cerrados no circulares: " & bols.Count & " grupos.")
+	For Each vi As VistaInfo In New VistaInfo() {mVert, mInf, mLateral, mFrontal}
+		If vi Is Nothing Then Continue For
+		Dim dv() As Double = DirVista(vi)
+		If dv Is Nothing Then Continue For
+		Dim nHechos As Integer = 0
+		For Each b As Bolsillo In bols
+			If b.Hecho OrElse nHechos >= MAX_BOLSILLOS Then Continue For
+			If b.NX * dv(0) + b.NY * dv(1) + b.NZ * dv(2) < 0.999 Then Continue For
+			b.Visto = True
+			If AcotarBolsillo(vi, b) Then
+				b.Hecho = True
+				nHechos += 1
+			End If
+		Next
+	Next
+	For Each b As Bolsillo In bols
+		If b.Hecho Then Continue For
+		Dim etq As String = If(b.Caras.Count > 1, b.Caras.Count & "X ", "") & ChrW(&H21A7) & " " & F(b.Prof, 2)
+		If b.Visto Then
+			Falta("Bolsillo " & etq & ": su nota no cabe sin tocar otra anotacion.")
+		Else
+			Aviso("Bolsillo " & etq & ": ninguna vista lo ve de frente; su profundidad no queda en el plano.")
+		End If
+	Next
+End Sub
+
+' Nota con flecha sobre una arista visible del fondo: nX simbolo de profundidad y medida
+Private Function AcotarBolsillo(vi As VistaInfo, b As Bolsillo) As Boolean
+	Dim dc As DrawingCurve = Nothing
+	Dim lonMax As Double = 0
+	For Each fc As Object In b.Caras
+		Try
+			For Each lazo As Object In fc.EdgeLoops
+				If Not CBool(lazo.IsOuterEdgeLoop) Then Continue For
+				For Each ed As Object In lazo.Edges
+					Try
+						For Each c2 As DrawingCurve In vi.V.DrawingCurves(ed)
+							If c2.CurveType <> CurveTypeEnum.kLineSegmentCurve Then Continue For
+							Dim oculta As Boolean = False
+							Try
+								Dim o2 As Object = c2
+								oculta = CBool(o2.Segments.Item(1).HiddenLine)
+							Catch
+							End Try
+							If oculta Then Continue For
+							Dim s1 As Inventor.Point2d = c2.StartPoint
+							Dim s2 As Inventor.Point2d = c2.EndPoint
+							If Not vi.R.Expandir(0.01).Contiene((s1.X + s2.X) / 2.0, (s1.Y + s2.Y) / 2.0) Then Continue For
+							Dim lc As Double = Dist(s1.X, s1.Y, s2.X, s2.Y)
+							If lc > lonMax Then
+								lonMax = lc
+								dc = c2
+							End If
+						Next
+					Catch
+					End Try
+				Next
+			Next
+		Catch
+		End Try
+	Next
+	If dc Is Nothing OrElse lonMax < 0.1 Then
+		Linea("   " & vi.Nombre & ": el fondo del bolsillo de " & F(b.Prof, 2) & " mm no tiene una arista visible para la flecha.")
+		Return False
+	End If
+	Dim ax As Double = (dc.StartPoint.X + dc.EndPoint.X) / 2.0
+	Dim ay As Double = (dc.StartPoint.Y + dc.EndPoint.Y) / 2.0
+	Dim cant As Integer = b.Caras.Count
+	Dim txtPlano As String = If(cant > 1, cant & "X ", "") & ChrW(&H21A7) & " " & F(b.Prof, 2)
+	Dim txtForm As String = If(cant > 1, cant & "X ", "") & "<StyleOverride Font='" & FUENTE_PROF & "'>" & ChrW(&H21A7) & "</StyleOverride> " & F(b.Prof, 2)
+	Dim angulos() As Double = {45, 135, 315, 225, 60, 120, 300, 240, 30, 150, 330, 210, 90, 270, 0, 180}
+	For pasada As Integer = 0 To 1
+		For Each sep As Double In New Double() {0.6, 0.9, 1.3, 1.8, 2.4, 3.0, 3.6, 4.3, 5.0}
+			For Each ang As Double In angulos
+				Dim ux As Double = Math.Cos(ang * Math.PI / 180.0)
+				Dim uy As Double = Math.Sin(ang * Math.PI / 180.0)
+				Dim tb As Double = HastaBorde(vi.R, ax, ay, ux, uy)
+				Dim tx As Double = ax + ux * (tb + sep)
+				Dim ty As Double = ay + uy * (tb + sep)
+				Dim sentido As Double = If(tx >= ax, 1.0, -1.0)
+				Dim cj As Marco = CajaEstimada(tx, ty, txtPlano.Length, 0.35, sentido, 0, False).Expandir(0.1)
+				If Not CajaLibre(cj) Then Continue For
+				If Not LiderLibre(ax, ay, tx, ty, vi.Nombre, pasada = 0) Then Continue For
+				Dim nota As LeaderNote = Nothing
+				Try
+					Dim col As ObjectCollection = ThisApplication.TransientObjects.CreateObjectCollection()
+					col.Add(Pt(tx, ty))
+					col.Add(mHoja.CreateGeometryIntent(dc, PointIntentEnum.kMidPointIntent))
+					Try
+						nota = mHoja.DrawingNotes.LeaderNotes.Add(col, txtForm)
+					Catch
+						nota = mHoja.DrawingNotes.LeaderNotes.Add(col, txtPlano)
+					End Try
+				Catch ex As Exception
+					Linea("   " & vi.Nombre & ": no se pudo crear la nota de profundidad: " & ex.Message)
+					Return False
+				End Try
+				mObst.Add(New Obstaculo(cj, "texto"))
+				mLideres.Add(New Double() {ax, ay, tx, ty})
+				Dim desc As String = txtPlano & " mm (bolsillo)"
+				mCreadas.Add(New Creada(nota, vi.Nombre, desc))
+				mCreadas(mCreadas.Count - 1).Caja = cj
+				mProfHechas += 1
+				Ok(vi.Nombre & ": " & desc)
+				Return True
+			Next
+		Next
+	Next
+	Return False
+End Function
 
 Private Function CrearRadial(g As GrupoD, rep As Circ, org As Inventor.Point2d) As Object
 	Dim motivo As String = ""
@@ -3315,6 +3808,11 @@ Private Class Circ
 	Public Barrido As Double
 	Public Completo As Boolean
 	Public Curva As DrawingCurve
+	' Datos del cilindro en el modelo. Tipo: 0 sin datos, 1 agujero ciego, 2 pasante, 3 saliente
+	Public Prof As Double = -1
+	Public Tipo As Integer = 0
+	Public Concavo As Boolean
+	Public InfoLeida As Boolean
 End Class
 
 Private Class VistaInfo
@@ -3349,6 +3847,18 @@ Private Class GrupoD
 	Public EsRadio As Boolean
 	Public Rep As Circ
 	Public Miembros As New List(Of Circ)
+	Public Prof As Double = -1
+	Public Tipo As Integer = 0
+End Class
+
+Private Class Bolsillo
+	Public NX As Double
+	Public NY As Double
+	Public NZ As Double
+	Public Prof As Double
+	Public Caras As New List(Of Object)
+	Public Visto As Boolean
+	Public Hecho As Boolean
 End Class
 
 Private Class Obstaculo
